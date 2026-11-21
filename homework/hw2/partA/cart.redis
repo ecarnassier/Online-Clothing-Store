@@ -1,0 +1,195 @@
+# ============================================================
+# HW2 – Redis – Part A
+# TASK: Shopping cart with expiration (temporary state)
+# ------------------------------------------------------------
+# Data types and key schema:
+#
+#   cart:{userId}              Hash   SKU -> quantity
+#       The cart of one customer. SKU = product + size + colour,
+#       e.g. p01-M-black, so size and colour are part of the field name.
+#       The whole cart expires after 30 minutes without any change.
+#
+#   product:card:{productId}   Hash   name, price, img
+#       Product card with the data needed to display the cart.
+#       ONE card per product, shared by all carts. It is a copy of the
+#       product from the MongoDB catalogue (HW1) kept in Redis for 1 hour.
+#
+# What the task does:
+#   - customers add items, change quantities and remove items;
+#   - the cart is displayed with name, size, colour, image, quantity
+#     and price, read only from Redis (cart + product cards);
+#   - when a price changes, only ONE product card is updated and every
+#     cart that contains the product shows the new price immediately;
+#   - an abandoned cart is deleted by Redis automatically after 30 minutes;
+#     every change of the cart refreshes the expiration.
+#
+# Result: the content of a cart, the product cards of its items, the number
+# of items, the remaining lifetime of a cart, the new price visible in
+# several carts after one update, and the proof that an abandoned cart
+# disappears automatically.
+#
+# Why Redis: the cart and the product cards are read on almost every page,
+# so they are kept in memory for fast access – opening a cart needs no
+# MongoDB query. HINCRBY changes a quantity atomically (two clicks at the
+# same time never lose an update) and EXPIRE removes abandoned carts without
+# any cleanup job. Product data are stored once per product, not copied into
+# every cart, so they never become outdated in the carts. Placed orders are
+# stored permanently in MongoDB.
+#
+# Product ids p01–p15 are the products from HW1 (MongoDB).
+#
+# Run (redis-cli does not accept comment lines):
+#   grep -v '^#' hw2-cart.redis | grep -v '^$' | redis-cli
+# ============================================================
+
+# Clean start
+DEL cart:u1 cart:u2 cart:u3 cart:u4 cart:u5 cart:u6 cart:u7 cart:u8 cart:u9 cart:u10
+DEL product:card:p01 product:card:p02 product:card:p03 product:card:p04 product:card:p05 product:card:p06 product:card:p07 product:card:p09 product:card:p10 product:card:p12 product:card:p13 product:card:p14 product:card:p15
+
+
+# ---------- Product cards (copied from the HW1 catalogue, kept 1 hour) ----------
+HSET product:card:p01 name "Basic Tee"          price 499  img /img/p01.jpg
+HSET product:card:p02 name "Oversized Tee"      price 699  img /img/p02.jpg
+HSET product:card:p03 name "Linen Tee"          price 1190 img /img/p03.jpg
+HSET product:card:p04 name "Longsleeve Tee"     price 899  img /img/p04.jpg
+HSET product:card:p05 name "Slim Fit Jeans"     price 1490 img /img/p05.jpg
+HSET product:card:p06 name "Regular Jeans"      price 790  img /img/p06.jpg
+HSET product:card:p07 name "Skinny Black Jeans" price 1690 img /img/p07.jpg
+HSET product:card:p09 name "Urban Sneaker"      price 2490 img /img/p09.jpg
+HSET product:card:p10 name "Leather Boot"       price 3990 img /img/p10.jpg
+HSET product:card:p12 name "Running Shoe"       price 2890 img /img/p12.jpg
+HSET product:card:p13 name "Graphic Tee"        price 599  img /img/p13.jpg
+HSET product:card:p14 name "Wide Leg Jeans"     price 1890 img /img/p14.jpg
+HSET product:card:p15 name "Chelsea Boot"       price 3490 img /img/p15.jpg
+
+EXPIRE product:card:p01 3600
+EXPIRE product:card:p02 3600
+EXPIRE product:card:p03 3600
+EXPIRE product:card:p04 3600
+EXPIRE product:card:p05 3600
+EXPIRE product:card:p06 3600
+EXPIRE product:card:p07 3600
+EXPIRE product:card:p09 3600
+EXPIRE product:card:p10 3600
+EXPIRE product:card:p12 3600
+EXPIRE product:card:p13 3600
+EXPIRE product:card:p14 3600
+EXPIRE product:card:p15 3600
+
+
+# ---------- Test data: 10 carts of 10 customers ----------
+# Basic Tee p01 is in three carts (u1, u7, u9) – used in step 2.
+HSET cart:u1  p01-M-black 1 p05-30-blue 1 p09-40-white 1
+HSET cart:u2  p03-S-beige 2 p12-43-black 1
+HSET cart:u3  p06-32-blue 1 p10-39-brown 1 p14-28-blue 1
+HSET cart:u4  p02-L-black 1
+HSET cart:u5  p07-28-black 1 p15-40-black 1
+HSET cart:u6  p04-M-grey 3
+HSET cart:u7  p13-M-white 1 p01-L-white 1
+HSET cart:u8  p12-42-blue 1
+HSET cart:u9  p14-30-blue 2 p01-S-white 1
+HSET cart:u10 p10-41-black 1
+
+# Every cart expires after 30 minutes (1800 s) of inactivity
+EXPIRE cart:u1 1800
+EXPIRE cart:u2 1800
+EXPIRE cart:u3 1800
+EXPIRE cart:u4 1800
+EXPIRE cart:u5 1800
+EXPIRE cart:u6 1800
+EXPIRE cart:u7 1800
+EXPIRE cart:u8 1800
+EXPIRE cart:u9 1800
+EXPIRE cart:u10 1800
+
+
+# ---------- 1. Open the cart of u1 – everything from Redis ----------
+# Items and quantities
+# Expected result: p01-M-black 1, p05-30-blue 1, p09-40-white 1
+HGETALL cart:u1
+# Name, price and image of each item (product id = beginning of the SKU)
+# Expected result: Basic Tee 499 /img/p01.jpg, Slim Fit Jeans 1490 /img/p05.jpg,
+#                  Urban Sneaker 2490 /img/p09.jpg
+HMGET product:card:p01 name price img
+HMGET product:card:p05 name price img
+HMGET product:card:p09 name price img
+# The cart page shows e.g.: [image] Basic Tee, M, black, 1 pc, 499 CZK
+
+
+# ---------- 2. Price change – one update, visible in all carts ----------
+# Basic Tee goes on sale: 499 -> 449 CZK. Only one key is updated.
+# Expected result: 0 (existing field overwritten)
+HSET product:card:p01 price 449
+
+# Three different carts contain Basic Tee (u1, u7, u9). All of them read
+# the price from the same card, so all of them now show 449.
+# Expected result: 449 (new price), 1 (u7 has Basic Tee), 1 (u9 has Basic Tee)
+HGET product:card:p01 price
+HEXISTS cart:u7 p01-L-white
+HEXISTS cart:u9 p01-S-white
+
+
+# ---------- 3. Add the same item again ----------
+# u1 adds one more piece of p01-M-black: the quantity grows,
+# no second line is created. The lifetime of the cart is refreshed.
+# Expected result: 2
+HINCRBY cart:u1 p01-M-black 1
+EXPIRE cart:u1 1800
+
+# ---------- 4. Add a new item ----------
+# Expected result: 1 (one new item)
+HINCRBY cart:u4 p13-M-white 1
+EXPIRE cart:u4 1800
+
+# ---------- 5. Decrease the quantity ----------
+# u6 decreases the quantity of p04-M-grey from 3 to 2
+# Expected result: 2
+HINCRBY cart:u6 p04-M-grey -1
+EXPIRE cart:u6 1800
+
+# ---------- 6. Remove an item ----------
+# u3 removes p10-39-brown from the cart
+# Expected result: 1 (one item removed)
+HDEL cart:u3 p10-39-brown
+EXPIRE cart:u3 1800
+
+# Number of different items in the cart of u3
+# Expected result: 2
+HLEN cart:u3
+
+# Is the item in the cart?
+# Expected result: 1 (yes) and 0 (no)
+HEXISTS cart:u4 p13-M-white
+HEXISTS cart:u4 p05-30-blue
+
+
+# ---------- 7. Open the cart of u1 again ----------
+# Expected result: p01-M-black 2, p05-30-blue 1, p09-40-white 1
+HGETALL cart:u1
+# Expected result: Basic Tee 449 /img/p01.jpg – the new price
+HMGET product:card:p01 name price img
+
+
+# ---------- 8. Remaining lifetime ----------
+# Expected result: a value close to 1800 seconds (cart) and 3600 seconds (card)
+TTL cart:u1
+TTL product:card:p01
+
+
+# ---------- 9. Automatic expiration of an abandoned cart ----------
+# Cart u10 is abandoned. For the demonstration its lifetime is shortened to 2 s.
+EXPIRE cart:u10 2
+# Wait at least 2 seconds before running the next command.
+# Expected result: 0 – the abandoned cart was deleted by Redis automatically
+EXISTS cart:u10
+# Expected result: 1 – the active cart of u1 still exists
+EXISTS cart:u1
+# Expected result: 1 – product cards are not affected, they are shared by all carts
+EXISTS product:card:p10
+
+
+# ---------- 10. Checkout ----------
+# u2 places an order: the order is saved in MongoDB, then the cart is deleted
+# Expected result: 1 (cart deleted), then 0 (cart no longer exists)
+DEL cart:u2
+EXISTS cart:u2
