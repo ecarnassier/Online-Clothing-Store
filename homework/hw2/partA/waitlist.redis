@@ -1,0 +1,161 @@
+# ============================================================
+# HW2 – Redis – Part A
+# TASK: Back-in-stock waitlist ("notify me when the size is back in stock")
+#       FIFO queue with duplicate prevention
+# ------------------------------------------------------------
+# Data type and key schema:
+#
+#   waitlist:{sku}             Sorted Set   member = userId, score = time of joining
+#       One waitlist per sold-out variant. SKU = product + size + colour,
+#       e.g. p13-M-white (the same SKU format as in the cart task).
+#       The score is the Unix time (seconds) when the customer clicked
+#       "Notify me", so the order of the set is the order of arrival.
+#
+# What the task does:
+#   - a customer joins the waitlist of a sold-out size (ZADD NX);
+#   - a customer who clicks "Notify me" again is NOT added a second time and
+#     keeps the original place in the queue (NX = only add new members);
+#   - the customer sees his position in the queue (ZRANK) and the shop sees
+#     the whole queue in the order of arrival (ZRANGE);
+#   - a customer can leave the waitlist (ZREM);
+#   - when N pieces of the size come back in stock, the first N customers
+#     are taken from the queue in FIFO order and notified (ZPOPMIN key N);
+#   - requests older than 30 days are removed by time (ZREMRANGEBYSCORE).
+#
+# Result: the queue in the order of arrival, 0 for a duplicate request (the
+# queue does not change), the position of a customer, the customers that
+# are notified first when the size is back in stock, and the queue after
+# a cancellation, a notification and a cleanup.
+#
+# Why Redis: a waitlist is short-lived state that changes on every click,
+# so it is kept in memory. A sorted set gives both properties of the task in
+# ONE atomic command: ZADD NX ignores a member that already exists (no
+# duplicates, no check-then-insert race when the button is clicked twice) and
+# the score keeps the FIFO order. ZPOPMIN removes and returns the first N
+# customers atomically, so two workers processing a restock can never notify
+# the same customer twice. A plain List + Set would need an "if" in the
+# application (or a Lua script) to prevent duplicates, which a sorted set
+# does natively. Requires Redis 6.2+ (ZMSCORE).
+#
+# Product ids and sold-out variants (stock 0) are taken from HW1 (MongoDB):
+#   p13-M-white  Graphic Tee, M, white
+#   p09-42-black Urban Sneaker, 42, black
+#   p15-42-brown Chelsea Boot, 42, brown
+# User ids u1–u12 are the same customers as in the cart task.
+#
+# Run (redis-cli does not accept comment lines):
+#   grep -v '^#' waitlist.redis | grep -v '^$' | redis-cli
+# ============================================================
+
+# Clean start
+DEL waitlist:p13-M-white waitlist:p09-42-black waitlist:p15-42-brown
+
+
+# ---------- Test data: 14 waitlist entries of 12 customers ----------
+# Score = Unix time of joining. 1795000000 = 2026-11-18 11:06:40 UTC.
+# u1 and u2 wait for two different sizes – every waitlist is independent.
+
+# Graphic Tee, M, white – 7 customers
+# order of arrival: u3 (+0 min), u7 (+10), u1 (+20), u9 (+50), u5 (+2 h), u2 (+3 h), u11 (+4 h)
+# Expected result: 7
+ZADD waitlist:p13-M-white NX 1795000000 u3 1795000600 u7 1795001200 u1 1795003000 u9 1795007200 u5 1795010800 u2 1795014400 u11
+
+# Urban Sneaker, 42, black – 4 customers
+# Expected result: 4
+ZADD waitlist:p09-42-black NX 1795002000 u4 1795004000 u1 1795006000 u8 1795009000 u10
+
+# Chelsea Boot, 42, brown – 3 customers, u12 joined already on 2026-10-14
+# Expected result: 3
+ZADD waitlist:p15-42-brown NX 1792000000 u12 1795005000 u6 1795008000 u2
+
+
+# ---------- 1. Length of every waitlist ----------
+# Expected result: 7, 4, 3
+ZCARD waitlist:p13-M-white
+ZCARD waitlist:p09-42-black
+ZCARD waitlist:p15-42-brown
+
+
+# ---------- 2. The whole queue in the order of arrival ----------
+# Expected result: u3, u7, u1, u9, u5, u2, u11 (with their join times)
+ZRANGE waitlist:p13-M-white 0 -1 WITHSCORES
+
+
+# ---------- 3. Duplicate request – the customer clicks "Notify me" again ----------
+# u1 is already waiting (joined at 1795001200) and clicks again later.
+# NX: the existing member is not changed.
+# Expected result: 0 (nothing added)
+ZADD waitlist:p13-M-white NX 1795020000 u1
+# The original join time is kept, so u1 does not lose the place in the queue.
+# (A plain ZADD without NX would overwrite the score and move u1 to the end.)
+# Expected result: 1795001200
+ZSCORE waitlist:p13-M-white u1
+# The queue still has 7 customers – u1 is not in it twice.
+# Expected result: 7
+ZCARD waitlist:p13-M-white
+# Position of u1 (0-based) – the page shows "You are number 3 in the queue".
+# Expected result: 2
+ZRANK waitlist:p13-M-white u1
+
+
+# ---------- 4. A new customer joins ----------
+# Expected result: 1 (one new customer added)
+ZADD waitlist:p13-M-white NX 1795018000 u6
+# The new customer is at the end of the queue.
+# Expected result: 7 (8th in the queue) and 8 customers in total
+ZRANK waitlist:p13-M-white u6
+ZCARD waitlist:p13-M-white
+
+
+# ---------- 5. Is the customer on this waitlist? ----------
+# u1 is waiting for Graphic Tee M white, u4 is not (u4 waits for the sneaker).
+# Expected result: 1795001200 (u1 is waiting), nil (u4 is not)
+ZMSCORE waitlist:p13-M-white u1 u4
+
+
+# ---------- 6. A customer leaves the waitlist ----------
+# u9 bought another size and cancels the request.
+# Expected result: 1 (removed)
+ZREM waitlist:p13-M-white u9
+# Customers behind u9 move up: u5 was number 5, now number 4.
+# Expected result: 3
+ZRANK waitlist:p13-M-white u5
+
+
+# ---------- 7. The size is back in stock – notify in FIFO order ----------
+# 3 pieces of Graphic Tee M white arrived. The first 3 customers are taken
+# from the queue and notified; the operation is atomic.
+# Expected result: u3, u7, u1 (with their join times) – exactly the first three
+ZPOPMIN waitlist:p13-M-white 3
+# The rest of the queue keeps waiting in the same order.
+# Expected result: u5, u2, u11, u6
+ZRANGE waitlist:p13-M-white 0 -1
+# u1 is still waiting for the sneaker – the waitlists are independent.
+# Expected result: 1795004000
+ZSCORE waitlist:p09-42-black u1
+
+
+# ---------- 8. A notified customer may join again ----------
+# u3 was notified (no longer in the queue), so a new request is accepted,
+# but u3 goes to the end of the queue like any new customer.
+# Expected result: 1 (added), then 4 (5th in the queue)
+ZADD waitlist:p13-M-white NX 1795030000 u3
+ZRANK waitlist:p13-M-white u3
+
+
+# ---------- 9. Cleanup of old requests ----------
+# Now = 1795400000 (2026-11-23). Requests older than 30 days
+# (joined before 1795400000 - 2592000 = 1792808000) are removed by time.
+# Expected result: 1 (u12 – joined on 2026-10-14)
+ZREMRANGEBYSCORE waitlist:p15-42-brown -inf 1792808000
+# Expected result: u6, u2
+ZRANGE waitlist:p15-42-brown 0 -1
+
+
+# ---------- 10. More pieces arrived than customers are waiting ----------
+# 10 pieces of Urban Sneaker 42 black arrived, only 4 customers are waiting.
+# Expected result: u4, u1, u8, u10 – all of them in the order of arrival
+ZPOPMIN waitlist:p09-42-black 10
+# Redis deletes an empty sorted set automatically – no cleanup needed.
+# Expected result: 0 (the waitlist no longer exists)
+EXISTS waitlist:p09-42-black
