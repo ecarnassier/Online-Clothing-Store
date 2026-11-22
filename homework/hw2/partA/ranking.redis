@@ -1,0 +1,125 @@
+# ============================================================
+# HW2 – Redis – Part A
+# TASK: Ranking of the most popular products (Top-N)
+# ------------------------------------------------------------
+# Data type and key schema:
+#
+#   product:ranking:popularity   Sorted Set   productId -> popularity score
+#       member = product id (p01-p15, the products from HW1 / MongoDB)
+#       score  = popularity points collected from customer events
+#   Product ids p01-p15 are the products from HW1 (MongoDB).
+#   The ranking measures customer interest only. Stock is not part of it:
+#   a sold-out product (e.g. p13 Graphic Tee in HW1) can still be popular,
+#   and availability is checked in MongoDB when the Top-N is displayed.
+#
+# Points per event (ZINCRBY with a different increment per event type):
+#   product view                +1   (weakest signal of interest)
+#   product added to wishlist   +3   (customer wants the product later)
+#   product added to cart       +5   (strongest signal, close to a purchase)
+#
+# What the task does:
+#   - 15 products start with a score from the previous activity;
+#   - every customer event raises the score of its product by the
+#     points of the event type;
+#   - the Top-N products are read directly from the Sorted Set, from the
+#     highest score to the lowest;
+#   - products with the same score are ordered by the product id
+#     (in the reverse order for the descending ranking).
+#
+# Result: the Top-5 products with their scores before and after a series
+# of events, the order of products with equal scores, the score and the
+# rank of one product, the number of ranked products and the number of
+# products above a given score. The test shows that the weights work:
+# a product with few views but many cart additions overtakes products
+# that were only viewed.
+#
+# Why Redis: the ranking is read on every page with recommendations
+# ("Popular products"), so it must be fast. A Sorted Set keeps the members
+# ordered by score all the time (insert and update in O(log N)), so
+# reading the Top-N needs no sorting and no query over all products.
+# ZINCRBY changes a score atomically, so two customers who add the same
+# product at the same moment never lose a point. The ranking is kept in
+# memory, and the whole task is solved with native Redis commands only.
+# The ranking is used for recommendations, not for exact statistics,
+# so one Sorted Set with weighted points is enough.
+#
+# Note: ZRANGE ... REV needs Redis 6.2+. In older versions use
+# ZREVRANGE key 0 4 WITHSCORES, the result is the same.
+#
+# Run (redis-cli does not accept comment lines):
+#   grep -v '^#' ranking.redis | grep -v '^$' | redis-cli
+# ============================================================
+
+# Clean start
+DEL product:ranking:popularity
+
+
+# ---------- Initial data: 15 products with scores from the previous activity ----------
+# p02 and p13 have the same score (19), p03 and p15 have the same score (12).
+# p13 (Graphic Tee) is sold out in HW1 but stays in the ranking on purpose,
+# see the note in the header.
+# Expected result: 15 (number of new members)
+ZADD product:ranking:popularity 40 p09 35 p12 30 p05 26 p10 24 p01 22 p07 19 p02 19 p13 17 p14 16 p06 14 p08 12 p03 12 p15 11 p11 9 p04
+
+
+# ---------- 1. Top-5 before the events ----------
+# Expected result (member, score):
+#   p09 40, p12 35, p05 30, p10 26, p01 24
+ZRANGE product:ranking:popularity 0 4 REV WITHSCORES
+
+
+# ---------- 2. Products with equal scores ----------
+# Ranks 6-8 contain the tie of p02 and p13 (both 19).
+# Equal scores are ordered by member, in the reverse order for REV.
+# Expected result: p07 22, p13 19, p02 19
+ZRANGE product:ranking:popularity 5 7 REV WITHSCORES
+
+
+# ---------- 3. Customer events ----------
+# Regular Jeans (p06, score 16) is not in the Top-5 yet.
+# Two customers view it (+1 each).
+# Expected result: 17, then 18
+ZINCRBY product:ranking:popularity 1 p06
+ZINCRBY product:ranking:popularity 1 p06
+# One customer adds it to the wishlist (+3).
+# Expected result: 21
+ZINCRBY product:ranking:popularity 3 p06
+# Three customers add it to the cart (+5 each).
+# Expected result: 26, then 31, then 36
+ZINCRBY product:ranking:popularity 5 p06
+ZINCRBY product:ranking:popularity 5 p06
+ZINCRBY product:ranking:popularity 5 p06
+
+# Urban Sneaker (p09, the leader) is only viewed by three customers (+1 each).
+# Expected result: 41, 42, 43
+ZINCRBY product:ranking:popularity 1 p09
+ZINCRBY product:ranking:popularity 1 p09
+ZINCRBY product:ranking:popularity 1 p09
+
+
+# ---------- 4. Top-5 after the events ----------
+# p06 jumped from rank 10 to rank 2 thanks to the cart additions,
+# p01 dropped out of the Top-5 (it is now on rank 6).
+# Expected result (member, score):
+#   p09 43, p06 36, p12 35, p05 30, p10 26
+ZRANGE product:ranking:popularity 0 4 REV WITHSCORES
+
+
+# ---------- 5. Checks ----------
+# Score of one product
+# Expected result: 36
+ZSCORE product:ranking:popularity p06
+
+# Rank of a product in the descending ranking (0 = the first place)
+# Expected result: 1 (p06), 0 (p09), 5 (p01)
+ZREVRANK product:ranking:popularity p06
+ZREVRANK product:ranking:popularity p09
+ZREVRANK product:ranking:popularity p01
+
+# Number of ranked products
+# Expected result: 15
+ZCARD product:ranking:popularity
+
+# Number of products with at least 30 points (p09, p06, p12, p05)
+# Expected result: 4
+ZCOUNT product:ranking:popularity 30 +inf

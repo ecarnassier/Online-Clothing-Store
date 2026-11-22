@@ -39,7 +39,7 @@
 # Product ids p01–p15 are the products from HW1 (MongoDB).
 #
 # Run (redis-cli does not accept comment lines):
-#   grep -v '^#' hw2-cart.redis | grep -v '^$' | redis-cli
+#   grep -v '^#' cart.redis | grep -v '^$' | redis-cli
 # ============================================================
 
 # Clean start
